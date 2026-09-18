@@ -1,0 +1,548 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Flappy Kiro</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      background: #1a1a2e;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      overflow: hidden;
+    }
+
+    canvas {
+      display: block;
+      margin: auto;
+      image-rendering: pixelated;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="gameCanvas"></canvas>
+
+  <script>
+    // ─── Constants ───────────────────────────────────────────────────────────────
+
+    const LOGICAL_W = 480;
+    const LOGICAL_H = 640;
+    const GRAVITY             = 1800;   // px/s² in logical coords
+    const FLAP_VY             = -550;   // px/s upward impulse
+    const SCROLL_SPEED        = 200;    // px/s leftward
+    const PIPE_WIDTH          = 60;     // px
+    const PIPE_GAP            = 160;    // px vertical gap
+    const PIPE_SPAWN_INTERVAL = 1.8;    // seconds between spawns
+    const GAP_MIN_Y           = 120;    // top of gap, minimum
+    const GAP_MAX_Y           = LOGICAL_H - 120 - PIPE_GAP; // top of gap, maximum
+    const COLLISION_INSET     = 6;      // px inset for AABB leniency
+
+    const COLORS = {
+      background:    '#1a1a2e',
+      pipePrimary:   '#7c3aed',         // purple
+      pipeHighlight: '#0d9488',         // teal
+      scoreText:     '#ffffff',
+      overlay:       'rgba(0,0,0,0.55)',
+    };
+
+    // ─── Canvas Setup ────────────────────────────────────────────────────────────
+
+    const canvas = document.getElementById('gameCanvas');
+    const ctx    = canvas.getContext('2d');
+
+    canvas.width  = LOGICAL_W;
+    canvas.height = LOGICAL_H;
+
+    function resize() {
+      const scale = Math.min(
+        window.innerWidth  / LOGICAL_W,
+        window.innerHeight / LOGICAL_H
+      );
+      canvas.style.width  = (LOGICAL_W * scale) + 'px';
+      canvas.style.height = (LOGICAL_H * scale) + 'px';
+    }
+
+    window.onresize = resize;
+    resize();
+
+    // ─── Asset Loader ────────────────────────────────────────────────────────────
+
+    // Task 2.1 — Player sprite
+    let imgFailed = false;
+    const ghostImg = new Image();
+    ghostImg.onerror = () => { imgFailed = true; };
+    ghostImg.src = 'assets/ghosty.png';
+
+    // Task 2.2 — Audio assets
+    const jumpSfx     = new Audio('assets/jump.wav');
+    const gameOverSfx = new Audio('assets/game_over.wav');
+    jumpSfx.volume    = 0.6;
+    gameOverSfx.volume = 0.8;
+
+    function playSound(sfx) {
+      try { sfx.currentTime = 0; sfx.play(); } catch (e) { /* silent fail */ }
+    }
+
+    // ─── Background Stars (pre-generated) ────────────────────────────────────────
+
+    const STARS = [];
+    for (let i = 0; i < 80; i++) {
+      STARS.push({
+        x:    Math.random() * LOGICAL_W,
+        y:    Math.random() * LOGICAL_H,
+        r:    Math.random() < 0.3 ? 2 : 1,
+        // subtle brightness variation
+        alpha: 0.2 + Math.random() * 0.5,
+      });
+    }
+
+    // ─── Player Module ───────────────────────────────────────────────────────────
+
+    // Task 3.1 — Player object
+    const player = {
+      x:        LOGICAL_W * 0.25,
+      y:        0,
+      vy:       0,
+      rotation: 0,
+      width:    48,
+      height:   48,
+    };
+
+    player.reset = function () {
+      this.y        = LOGICAL_H * 0.45;
+      this.vy       = 0;
+      this.rotation = 0;
+    };
+
+    // Task 3.3 — Flap
+    player.flap = function () {
+      this.vy = FLAP_VY;
+    };
+
+    // Task 3.5 — Physics update
+    player.update = function (dt) {
+      this.vy += GRAVITY * dt;
+      this.y  += this.vy * dt;
+
+      // Rotation: lerp toward nose-up when flapping, nose-down when falling
+      const targetRot = this.vy < 0
+        ? -0.4
+        : Math.min(1.2, (this.vy / 600) * 1.2);
+      this.rotation += (targetRot - this.rotation) * 8 * dt;
+    };
+
+    // Task 3.6 — Draw player
+    player.draw = function (ctx, yOverride) {
+      const drawY = (yOverride !== undefined) ? yOverride : this.y;
+      ctx.save();
+      ctx.translate(this.x + this.width / 2, drawY + this.height / 2);
+      ctx.rotate(this.rotation);
+
+      if (imgFailed || !ghostImg.complete || ghostImg.naturalWidth === 0) {
+        // Fallback: ghost-shaped white rectangle with rounded corners
+        ctx.fillStyle = 'rgba(220, 200, 255, 0.95)';
+        ctx.beginPath();
+        ctx.roundRect(-this.width / 2, -this.height / 2, this.width, this.height, 12);
+        ctx.fill();
+        // Eye highlights
+        ctx.fillStyle = '#1a1a2e';
+        ctx.beginPath();
+        ctx.arc(-8, -6, 5, 0, Math.PI * 2);
+        ctx.arc(8, -6, 5, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.fillStyle = '#fff';
+        ctx.beginPath();
+        ctx.arc(-6, -7, 2, 0, Math.PI * 2);
+        ctx.arc(10, -7, 2, 0, Math.PI * 2);
+        ctx.fill();
+      } else {
+        ctx.drawImage(ghostImg, -this.width / 2, -this.height / 2, this.width, this.height);
+      }
+
+      ctx.restore();
+    };
+
+    // ─── Pipe Manager ────────────────────────────────────────────────────────────
+
+    // Tasks 5.1, 5.3, 5.6, 5.7
+    const pipeManager = {
+      pipes:      [],
+      spawnTimer: 0,
+
+      spawn() {
+        const gapY = GAP_MIN_Y + Math.random() * (GAP_MAX_Y - GAP_MIN_Y);
+        this.pipes.push({ x: LOGICAL_W + 10, gapY, scored: false });
+      },
+
+      update(dt) {
+        // Scroll pipes
+        for (const pipe of this.pipes) {
+          pipe.x -= SCROLL_SPEED * dt;
+        }
+
+        // Remove off-screen pipes
+        this.pipes = this.pipes.filter(p => p.x + PIPE_WIDTH >= 0);
+
+        // Spawn timer
+        this.spawnTimer += dt;
+        if (this.spawnTimer >= PIPE_SPAWN_INTERVAL) {
+          this.spawn();
+          this.spawnTimer = 0;
+        }
+      },
+
+      draw(ctx) {
+        const CAP_W      = PIPE_WIDTH + 12;  // cap is slightly wider than pipe
+        const CAP_H      = 18;               // cap height
+        const CAP_OFFSET = (CAP_W - PIPE_WIDTH) / 2;
+        const BORDER     = 3;
+
+        for (const pipe of this.pipes) {
+          // ── Top pipe ──────────────────────────────────────────────
+          // Body
+          ctx.fillStyle = COLORS.pipePrimary;
+          ctx.fillRect(pipe.x, 0, PIPE_WIDTH, pipe.gapY);
+
+          // Teal highlight stripe on right edge of top pipe
+          ctx.fillStyle = COLORS.pipeHighlight;
+          ctx.fillRect(pipe.x + PIPE_WIDTH - BORDER, 0, BORDER, pipe.gapY);
+          // Left edge
+          ctx.fillRect(pipe.x, 0, BORDER, pipe.gapY);
+
+          // Cap (facing the gap, at bottom of top pipe)
+          ctx.fillStyle = COLORS.pipePrimary;
+          ctx.fillRect(pipe.x - CAP_OFFSET, pipe.gapY - CAP_H, CAP_W, CAP_H);
+          // Cap teal border
+          ctx.fillStyle = COLORS.pipeHighlight;
+          ctx.fillRect(pipe.x - CAP_OFFSET, pipe.gapY - CAP_H, CAP_W, BORDER);           // top of cap
+          ctx.fillRect(pipe.x - CAP_OFFSET, pipe.gapY - BORDER, CAP_W, BORDER);           // bottom of cap
+          ctx.fillRect(pipe.x - CAP_OFFSET, pipe.gapY - CAP_H, BORDER, CAP_H);            // left of cap
+          ctx.fillRect(pipe.x - CAP_OFFSET + CAP_W - BORDER, pipe.gapY - CAP_H, BORDER, CAP_H); // right of cap
+
+          // ── Bottom pipe ───────────────────────────────────────────
+          const botY = pipe.gapY + PIPE_GAP;
+          const botH = LOGICAL_H - botY;
+
+          // Body
+          ctx.fillStyle = COLORS.pipePrimary;
+          ctx.fillRect(pipe.x, botY, PIPE_WIDTH, botH);
+
+          // Teal highlight stripe
+          ctx.fillStyle = COLORS.pipeHighlight;
+          ctx.fillRect(pipe.x + PIPE_WIDTH - BORDER, botY, BORDER, botH);
+          ctx.fillRect(pipe.x, botY, BORDER, botH);
+
+          // Cap (facing the gap, at top of bottom pipe)
+          ctx.fillStyle = COLORS.pipePrimary;
+          ctx.fillRect(pipe.x - CAP_OFFSET, botY, CAP_W, CAP_H);
+          // Cap teal border
+          ctx.fillStyle = COLORS.pipeHighlight;
+          ctx.fillRect(pipe.x - CAP_OFFSET, botY, CAP_W, BORDER);                         // top of cap
+          ctx.fillRect(pipe.x - CAP_OFFSET, botY + CAP_H - BORDER, CAP_W, BORDER);         // bottom of cap
+          ctx.fillRect(pipe.x - CAP_OFFSET, botY, BORDER, CAP_H);                          // left of cap
+          ctx.fillRect(pipe.x - CAP_OFFSET + CAP_W - BORDER, botY, BORDER, CAP_H);         // right of cap
+        }
+      },
+
+      reset() {
+        this.pipes      = [];
+        this.spawnTimer = 0;
+      },
+    };
+
+    // ─── Collision Detection ─────────────────────────────────────────────────────
+
+    // Task 6.1 — Pure AABB overlap
+    function aabbOverlap(r1, r2) {
+      return r1.x < r2.x + r2.w &&
+             r1.x + r1.w > r2.x &&
+             r1.y < r2.y + r2.h &&
+             r1.y + r1.h > r2.y;
+    }
+
+    // Task 6.3 — Collision check
+    function checkCollisions() {
+      const pr = {
+        x: player.x + COLLISION_INSET,
+        y: player.y + COLLISION_INSET,
+        w: player.width  - COLLISION_INSET * 2,
+        h: player.height - COLLISION_INSET * 2,
+      };
+
+      // Canvas boundary
+      if (player.y < 0 || player.y + player.height > LOGICAL_H) {
+        triggerGameOver();
+        return;
+      }
+
+      // Pipe collision
+      for (const pipe of pipeManager.pipes) {
+        const topPipe = { x: pipe.x, y: 0,                         w: PIPE_WIDTH, h: pipe.gapY };
+        const botPipe = { x: pipe.x, y: pipe.gapY + PIPE_GAP,      w: PIPE_WIDTH, h: LOGICAL_H - pipe.gapY - PIPE_GAP };
+        if (aabbOverlap(pr, topPipe) || aabbOverlap(pr, botPipe)) {
+          triggerGameOver();
+          return;
+        }
+      }
+    }
+
+    // ─── Score Manager ───────────────────────────────────────────────────────────
+
+    // Task 7.1
+    const scoreManager = {
+      current: 0,
+      high: (() => {
+        try { return parseInt(localStorage.getItem('flappyKiroHigh') || '0'); }
+        catch (e) { return 0; }
+      })(),
+
+      increment() {
+        this.current++;
+        if (this.current > this.high) this.high = this.current;
+      },
+
+      save() {
+        try { localStorage.setItem('flappyKiroHigh', this.high); } catch (e) { /* silent */ }
+      },
+
+      reset() {
+        this.current = 0;
+      },
+    };
+
+    // Task 7.3 — Check scoring
+    function checkScoring() {
+      for (const pipe of pipeManager.pipes) {
+        if (!pipe.scored && player.x >= pipe.x + PIPE_WIDTH / 2) {
+          scoreManager.increment();
+          pipe.scored = true;
+        }
+      }
+    }
+
+    // ─── State Machine ───────────────────────────────────────────────────────────
+
+    // Task 8.1
+    const STATE = { READY: 'READY', PLAYING: 'PLAYING', GAME_OVER: 'GAME_OVER' };
+    let gameState = STATE.READY;
+
+    // Task 8.2 — State transition functions
+    function startGame() {
+      gameState = STATE.PLAYING;
+    }
+
+    function triggerGameOver() {
+      gameState = STATE.GAME_OVER;
+      scoreManager.save();
+      playSound(gameOverSfx);
+    }
+
+    function restartGame() {
+      player.reset();
+      pipeManager.reset();
+      scoreManager.reset();
+      gameState = STATE.READY;
+    }
+
+    // ─── Input Handling ───────────────────────────────────────────────────────────
+
+    // Task 9
+    function handleInput() {
+      if      (gameState === STATE.READY)     { startGame(); player.flap(); playSound(jumpSfx); }
+      else if (gameState === STATE.PLAYING)   { player.flap(); playSound(jumpSfx); }
+      else if (gameState === STATE.GAME_OVER) { restartGame(); }
+    }
+
+    document.addEventListener('keydown', e => {
+      if (e.code === 'Space') { e.preventDefault(); handleInput(); }
+    });
+    canvas.addEventListener('pointerdown', () => handleInput());
+
+    // ─── Renderer ────────────────────────────────────────────────────────────────
+
+    // Task 11.1 — Background
+    function drawBackground(ctx) {
+      ctx.fillStyle = COLORS.background;
+      ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+      // Subtle star field
+      for (const star of STARS) {
+        ctx.globalAlpha = star.alpha;
+        ctx.fillStyle   = '#cce0ff';
+        ctx.fillRect(star.x, star.y, star.r, star.r);
+      }
+      ctx.globalAlpha = 1;
+    }
+
+    // Task 11.2 — HUD (score while playing)
+    function drawHUD(ctx) {
+      if (gameState !== STATE.PLAYING) return;
+
+      ctx.save();
+      ctx.font         = 'bold 52px monospace';
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'top';
+
+      // Drop shadow
+      ctx.fillStyle = 'rgba(0,0,0,0.6)';
+      ctx.fillText(scoreManager.current, LOGICAL_W / 2 + 2, 22);
+
+      // Score text
+      ctx.fillStyle = COLORS.scoreText;
+      ctx.fillText(scoreManager.current, LOGICAL_W / 2, 20);
+
+      ctx.restore();
+    }
+
+    // Task 11.3 — Ready screen
+    function drawReadyScreen(ctx) {
+      ctx.save();
+
+      // Semi-transparent top banner gradient
+      const grad = ctx.createLinearGradient(0, 0, 0, 200);
+      grad.addColorStop(0, 'rgba(26,26,46,0.85)');
+      grad.addColorStop(1, 'rgba(26,26,46,0)');
+      ctx.fillStyle = grad;
+      ctx.fillRect(0, 0, LOGICAL_W, 200);
+
+      // Title — "FLAPPY KIRO"
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+
+      // Glow
+      ctx.shadowColor  = '#7c3aed';
+      ctx.shadowBlur   = 18;
+      ctx.font         = 'bold 54px monospace';
+      ctx.fillStyle    = '#c084fc';   // light purple
+      ctx.fillText('FLAPPY KIRO', LOGICAL_W / 2, 110);
+
+      // Teal underline accent
+      ctx.shadowBlur  = 0;
+      ctx.strokeStyle = COLORS.pipeHighlight;
+      ctx.lineWidth   = 3;
+      const tw = ctx.measureText('FLAPPY KIRO').width;
+      ctx.beginPath();
+      ctx.moveTo(LOGICAL_W / 2 - tw / 2, 136);
+      ctx.lineTo(LOGICAL_W / 2 + tw / 2, 136);
+      ctx.stroke();
+
+      // Idle bob: purely visual y offset, does not touch player.y
+      const bobOffset = Math.sin(Date.now() / 400) * 8;
+      player.draw(ctx, player.y + bobOffset);
+
+      // High score badge (if any)
+      if (scoreManager.high > 0) {
+        ctx.font      = 'bold 20px monospace';
+        ctx.fillStyle = COLORS.pipeHighlight;
+        ctx.fillText('BEST: ' + scoreManager.high, LOGICAL_W / 2, LOGICAL_H * 0.72);
+      }
+
+      // Flashing prompt
+      const visible = Math.floor(Date.now() / 500) % 2 === 0;
+      if (visible) {
+        ctx.font      = 'bold 22px monospace';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('TAP or SPACE to start', LOGICAL_W / 2, LOGICAL_H * 0.82);
+      }
+
+      ctx.restore();
+    }
+
+    // Task 11.4 — Game Over screen
+    function drawGameOverScreen(ctx) {
+      ctx.save();
+
+      // Dark overlay
+      ctx.fillStyle = COLORS.overlay;
+      ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+      ctx.textAlign    = 'center';
+      ctx.textBaseline = 'middle';
+
+      // "GAME OVER" heading
+      ctx.shadowColor = 'rgba(239,68,68,0.8)';
+      ctx.shadowBlur  = 20;
+      ctx.font        = 'bold 62px monospace';
+      ctx.fillStyle   = '#f87171';   // soft red
+      ctx.fillText('GAME OVER', LOGICAL_W / 2, LOGICAL_H * 0.32);
+
+      ctx.shadowBlur  = 0;
+
+      // Score panel background
+      const panelX = LOGICAL_W / 2 - 140;
+      const panelY = LOGICAL_H * 0.44;
+      ctx.fillStyle = 'rgba(255,255,255,0.07)';
+      ctx.beginPath();
+      ctx.roundRect(panelX, panelY, 280, 110, 14);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+      ctx.lineWidth   = 1.5;
+      ctx.stroke();
+
+      // Score
+      ctx.font      = 'bold 32px monospace';
+      ctx.fillStyle = '#ffffff';
+      ctx.fillText('Score: ' + scoreManager.current, LOGICAL_W / 2, panelY + 36);
+
+      // High score
+      ctx.font      = 'bold 26px monospace';
+      ctx.fillStyle = COLORS.pipeHighlight;
+      ctx.fillText('Best: ' + scoreManager.high, LOGICAL_W / 2, panelY + 80);
+
+      // Flashing restart prompt
+      const visible = Math.floor(Date.now() / 500) % 2 === 0;
+      if (visible) {
+        ctx.font      = 'bold 22px monospace';
+        ctx.fillStyle = '#ffffff';
+        ctx.fillText('TAP or SPACE to restart', LOGICAL_W / 2, LOGICAL_H * 0.75);
+      }
+
+      ctx.restore();
+    }
+
+    // Task 11.5 — Wire draw()
+    function draw() {
+      drawBackground(ctx);
+      pipeManager.draw(ctx);
+      player.draw(ctx);
+      drawHUD(ctx);
+      if (gameState === STATE.READY)     drawReadyScreen(ctx);
+      if (gameState === STATE.GAME_OVER) drawGameOverScreen(ctx);
+    }
+
+    // ─── Game Loop ───────────────────────────────────────────────────────────────
+
+    // Task 10
+    let lastTime = null;
+
+    function loop(timestamp) {
+      if (lastTime === null) lastTime = timestamp;
+      const dt = Math.min((timestamp - lastTime) / 1000, 0.05);
+      lastTime = timestamp;
+
+      if (gameState === STATE.PLAYING) {
+        player.update(dt);
+        pipeManager.update(dt);
+        checkCollisions();
+        checkScoring();
+      }
+
+      draw();
+      requestAnimationFrame(loop);
+    }
+
+    // Initialise player position before first frame
+    player.reset();
+
+    requestAnimationFrame(loop);
+  </script>
+</body>
+</html>
